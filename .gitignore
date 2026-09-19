@@ -1,0 +1,53 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+.eggs/
+
+# ── Virtual Environments ──
+venv/
+env/
+.env/
+.venv/
+
+# ── Jupyter / Colab ──
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Dataset (too large for git) ──
+Fact Check Dataset/
+*.csv
+
+# ── Model Outputs (generated at runtime) ──
+outputs/
+*.bin
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ──
+*.log
+
+# ── Misc ──
+*.bak
+*.tmp
+.agents/
