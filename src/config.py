@@ -125,6 +125,33 @@ VERDICT_MAP = {
     "جھوٹ":             "FALSE",
     "سچ":               "TRUE",
     "گمراہ کن":         "MIXED",
+
+    # ── Arabic (Discovered high-frequency: 23k+ claims) ──
+    "خطأ":              "FALSE",
+    "صحيح":             "TRUE",
+    "مضلل":             "MIXED",
+
+    # ── Turkish (Discovered high-frequency: 7k+ claims) ──
+    "yanlış":           "FALSE",
+    "doğru":            "TRUE",
+
+    # ── French / Italian ──
+    "faux":             "FALSE",
+    "vrai":             "TRUE",
+    "notizia falsa":    "FALSE",
+    "fuori contesto":   "MIXED",
+
+    # ── Polish ──
+    "fałsz":            "FALSE",
+    "fałsz.":           "FALSE",
+    "prawda":           "TRUE",
+
+    # ── Chinese ──
+    "錯誤":             "FALSE",
+    "真實":             "TRUE",
+
+    # ── Additional nuanced English ──
+    "partly false":     "MIXED",
 }
 
 # Class-index mapping for model training
