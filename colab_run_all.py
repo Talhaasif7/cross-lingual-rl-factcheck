@@ -224,21 +224,38 @@ def find_or_upload_dataset():
             return p
 
     # If running inside Colab and file not found, offer file uploader
-    is_colab = "google.colab" in sys.modules or "COLAB_GPU" in os.environ
+    is_colab = "google.colab" in sys.modules or "COLAB_GPU" in os.environ or Path("/content").exists()
     if is_colab:
-        logger.info("Dataset not found. Opening file upload prompt for 'claim_review.csv'...")
-        from google.colab import files
-        uploaded = files.upload()
-        for fname, data in uploaded.items():
-            dst = DATA_DIR / "claim_review.csv"
-            with open(dst, "wb") as f:
-                f.write(data)
-            logger.info(f"Saved uploaded dataset to: {dst} ({len(data)/1024**2:.1f} MB)")
-            return dst
+        try:
+            logger.info("Dataset not found. Attempting file upload prompt for 'claim_review.csv'...")
+            from google.colab import files
+            uploaded = files.upload()
+            for fname, data in uploaded.items():
+                dst = DATA_DIR / "claim_review.csv"
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                with open(dst, "wb") as f:
+                    f.write(data)
+                logger.info(f"Saved uploaded dataset to: {dst} ({len(data)/1024**2:.1f} MB)")
+                return dst
+        except Exception as ex:
+            logger.warning(
+                f"Note: Interactive files.upload() cannot run inside '!python' subprocess ({ex}).\n"
+                "👉 Please upload 'claim_review.csv' using Colab's left sidebar (📁 Files icon -> Upload)\n"
+                "   or run: from google.colab import files; files.upload() in a separate notebook cell.\n"
+                "Waiting up to 180 seconds for 'claim_review.csv' to appear..."
+            )
+            for wait_step in range(36):
+                time.sleep(5)
+                for p in candidates:
+                    if p.exists() and p.stat().st_size > 1000:
+                        logger.info(f"Found uploaded dataset at: {p} ({p.stat().st_size / 1024**2:.1f} MB)")
+                        return p
+                if (wait_step + 1) % 6 == 0:
+                    logger.info(f"Still waiting for 'claim_review.csv'... ({(wait_step+1)*5}s elapsed)")
 
     raise FileNotFoundError(
-        "Could not find 'claim_review.csv'! Please place it in 'Fact Check Dataset/claim_review.csv' "
-        "or upload it to Colab."
+        "Could not find 'claim_review.csv'! Please drag & drop 'claim_review.csv' into Colab's "
+        "left sidebar (Files 📁 tab) or upload it in a notebook cell."
     )
 
 CSV_FILE = find_or_upload_dataset()
