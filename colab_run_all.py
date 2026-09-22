@@ -627,6 +627,16 @@ scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 baseline_reward = 0.0
 training_history = []
 
+# Compute class weights for weighted CE loss (combat class imbalance)
+# w_c = N_total / (NUM_CLASSES * N_c), normalized so mean = 1.0
+_label_counts = tr_data["label_id"].value_counts().sort_index()
+_n_total = len(tr_data)
+_cw = [_n_total / (NUM_CLASSES * _label_counts.get(c, 1)) for c in range(NUM_CLASSES)]
+class_weights = torch.tensor(_cw, dtype=torch.float32)
+class_weights = class_weights / class_weights.mean()
+class_weights = class_weights.to(device)
+logger.info(f"Class weights (inverse-frequency, normalized): {', '.join(f'{ID2LABEL[c]}={class_weights[c]:.4f}' for c in range(NUM_CLASSES))}")
+
 with timer("Phase 3 - Full REINFORCE Training Loop"):
     for epoch in range(NUM_EPOCHS):
         fga.train()
@@ -668,8 +678,8 @@ with timer("Phase 3 - Full REINFORCE Training Loop"):
                 advantage = (r_total - baseline_reward).detach()
                 policy_loss = -torch.mean(advantage * log_p)
 
-                # Auxiliary Cross-Entropy loss for stability
-                ce_loss = F.cross_entropy(logits, tgt)
+                # Auxiliary Cross-Entropy loss for stability (class-weighted)
+                ce_loss = F.cross_entropy(logits, tgt, weight=class_weights)
                 total_loss = (policy_loss + 0.5 * ce_loss) / GRAD_ACCUM_STEPS
 
             scaler.scale(total_loss).backward()
@@ -975,6 +985,110 @@ try:
     })
 except Exception as ex:
     logger.warning(f"Zero-shot kNN baseline failed: {ex}")
+
+# Ablation 3: No-R_cons (proves Counterfactual Consistency Reward drives de-biasing)
+logger.info("\n" + "="*80)
+logger.info("  ABLATION: Training with λ_cons = 0 (No R_cons, only R_acc)")
+logger.info("="*80)
+
+abl_fga = FeatureGatingAgent().to(device)
+abl_fusion = GatedFusion().to(device)
+abl_classifier = VeracityClassifier().to(device)
+abl_params = list(abl_fga.parameters()) + list(abl_classifier.parameters())
+abl_opt = torch.optim.AdamW(abl_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+abl_scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+abl_baseline = 0.0
+ABLATION_EPOCHS = 5
+
+for abl_epoch in range(ABLATION_EPOCHS):
+    abl_fga.train(); abl_classifier.train()
+    abl_losses, abl_correct, abl_total = [], 0, 0
+    abl_opt.zero_grad()
+    pbar = tqdm(train_loader, desc=f"Ablation {abl_epoch+1}/{ABLATION_EPOCHS}", unit="batch")
+    for step, batch in enumerate(pbar):
+        eq = batch["ce"].to(device)
+        es = batch["se"].to(device)
+        et = batch["de"].to(device)
+        tgt = batch["lbl"].to(device)
+        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+            aq, a_s, at = abl_fga(eq, es, et)
+            logits = abl_classifier(abl_fusion(eq, es, et, aq, a_s, at))
+            preds = logits.argmax(dim=-1)
+            r_acc = (preds == tgt).float() * 2.0 - 1.0
+            r_total = r_acc  # λ_cons = 0, no consistency reward
+            log_p = F.log_softmax(logits, dim=-1).gather(1, preds.unsqueeze(1)).squeeze(1)
+            advantage = (r_total - abl_baseline).detach()
+            policy_loss = -torch.mean(advantage * log_p)
+            ce_loss = F.cross_entropy(logits, tgt, weight=class_weights)
+            total_loss = (policy_loss + 0.5 * ce_loss) / GRAD_ACCUM_STEPS
+        abl_scaler.scale(total_loss).backward()
+        if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
+            abl_scaler.unscale_(abl_opt)
+            torch.nn.utils.clip_grad_norm_(abl_params, max_norm=1.0)
+            abl_scaler.step(abl_opt)
+            abl_scaler.update()
+            abl_opt.zero_grad()
+        abl_baseline = 0.99 * abl_baseline + 0.01 * r_total.mean().item()
+        abl_losses.append(total_loss.item() * GRAD_ACCUM_STEPS)
+        abl_correct += (preds == tgt).sum().item()
+        abl_total += len(tgt)
+        pbar.set_postfix(loss=f"{np.mean(abl_losses[-50:]):.4f}", acc=f"{abl_correct/abl_total:.3f}")
+    logger.info(f"  Ablation Epoch {abl_epoch+1}: Loss={np.mean(abl_losses):.4f}, Acc={abl_correct/abl_total:.4f}")
+
+# Evaluate ablation classification
+abl_fga.eval(); abl_classifier.eval()
+abl_preds_list = []
+with torch.no_grad():
+    for i in range(0, len(te_ce), PHYSICAL_BATCH_SIZE):
+        eq = te_ce[i:i+PHYSICAL_BATCH_SIZE].to(device)
+        es = te_se[i:i+PHYSICAL_BATCH_SIZE].to(device)
+        et = te_de[i:i+PHYSICAL_BATCH_SIZE].to(device)
+        aq, a_s, at = abl_fga(eq, es, et)
+        abl_preds_list.append(abl_classifier(abl_fusion(eq, es, et, aq, a_s, at)).argmax(dim=-1).cpu().numpy())
+abl_preds_arr = np.concatenate(abl_preds_list)
+abl_acc = float(accuracy_score(te_labels, abl_preds_arr))
+abl_f1 = float(f1_score(te_labels, abl_preds_arr, average="macro", zero_division=0))
+abl_prec = float(precision_score(te_labels, abl_preds_arr, average="macro", zero_division=0))
+abl_rec = float(recall_score(te_labels, abl_preds_arr, average="macro", zero_division=0))
+
+# Evaluate ablation SFR
+abl_flip_counts = np.zeros(n_test)
+with torch.no_grad():
+    abl_orig_preds = []
+    for i in range(0, n_test, 64):
+        eq = te_ce[i:i+64].to(device)
+        es = te_se[i:i+64].to(device)
+        et = te_de[i:i+64].to(device)
+        aq, a_s, at = abl_fga(eq, es, et)
+        abl_orig_preds.append(abl_classifier(abl_fusion(eq, es, et, aq, a_s, at)).argmax(dim=-1).cpu())
+    abl_orig_preds = torch.cat(abl_orig_preds)
+    for pert in tqdm(range(SFR_NUM_PERTURBATIONS), desc="Ablation SFR", unit="run"):
+        rand_sp = random.choices(sp_keys, k=n_test)
+        cf_se = torch.stack([sp_eval_map[s] for s in rand_sp])
+        abl_pert_preds = []
+        for i in range(0, n_test, 64):
+            eq = te_ce[i:i+64].to(device)
+            es_p = cf_se[i:i+64].to(device)
+            et = te_de[i:i+64].to(device)
+            aq, a_s, at = abl_fga(eq, es_p, et)
+            abl_pert_preds.append(abl_classifier(abl_fusion(eq, es_p, et, aq, a_s, at)).argmax(dim=-1).cpu())
+        abl_pert_preds = torch.cat(abl_pert_preds)
+        abl_flip_counts += (abl_orig_preds != abl_pert_preds).numpy().astype(float)
+
+abl_sfr = float(np.mean(abl_flip_counts / SFR_NUM_PERTURBATIONS))
+logger.info(f"  No-R_cons Ablation -> Acc={abl_acc:.4f}, F1={abl_f1:.4f}, SFR={abl_sfr:.4f} ({abl_sfr*100:.2f}%)")
+
+ablation_results.append({
+    "method": "No R_cons Ablation",
+    "accuracy": abl_acc, "macro_f1": abl_f1,
+    "macro_precision": abl_prec, "macro_recall": abl_rec,
+    "sfr": abl_sfr,
+})
+
+# Cleanup ablation model
+del abl_fga, abl_fusion, abl_classifier, abl_opt
+if device.type == "cuda":
+    torch.cuda.empty_cache()
 
 # ============================================================================
 # 5. FINAL REPORT & VISUALIZATIONS

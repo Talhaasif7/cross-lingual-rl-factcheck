@@ -236,6 +236,13 @@ USE_FP16 = True
 # Baseline EMA coefficient for REINFORCE variance reduction
 BASELINE_EMA_DECAY = 0.99
 
+# Auxiliary Cross-Entropy loss weight (combined with REINFORCE policy loss)
+AUX_CE_LOSS_WEIGHT = 0.5
+
+# Class-weighted CE loss to combat label imbalance (FALSE≫MIXED≫TRUE)
+# When True, inverse-frequency weights are computed dynamically from training data
+USE_CLASS_WEIGHTS = True
+
 # Checkpoint frequency
 CHECKPOINT_EVERY_N_EPOCHS = 2
 

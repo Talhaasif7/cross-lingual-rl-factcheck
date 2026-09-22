@@ -51,6 +51,7 @@ from src.config import (
     PHYSICAL_BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS,
     NUM_EPOCHS, WARMUP_RATIO, USE_FP16,
     BASELINE_EMA_DECAY, CHECKPOINT_EVERY_N_EPOCHS,
+    AUX_CE_LOSS_WEIGHT, USE_CLASS_WEIGHTS,
     RANDOM_SEED, LABEL2ID, ID2LABEL,
 )
 from src.config import init_directories
@@ -303,6 +304,7 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     grad_accum_steps: int = GRADIENT_ACCUMULATION_STEPS,
+    class_weights: torch.Tensor = None,
 ) -> dict:
     """
     Train one epoch using REINFORCE policy gradient.
@@ -325,6 +327,11 @@ def train_one_epoch(
 
     Returns:
         dict: Epoch metrics {loss, reward, accuracy, consistency, baseline}
+
+    Note:
+        class_weights: Optional inverse-frequency weights for the auxiliary CE
+        loss. When provided, minority classes (TRUE, MIXED) receive stronger
+        supervision signals. The RL policy gradient is NOT affected.
     """
     fga.train()
     classifier.train()
@@ -381,10 +388,11 @@ def train_one_epoch(
             policy_loss = -torch.mean(advantage.detach() * action_log_probs)
 
             # Add cross-entropy loss as auxiliary supervision signal
-            ce_loss = F.cross_entropy(logits_orig, targets)
+            # Class weights combat label imbalance (FALSE≫MIXED≫TRUE)
+            ce_loss = F.cross_entropy(logits_orig, targets, weight=class_weights)
 
             # Combined loss
-            total_loss = policy_loss + 0.5 * ce_loss
+            total_loss = policy_loss + AUX_CE_LOSS_WEIGHT * ce_loss
 
             # Scale for gradient accumulation
             total_loss = total_loss / grad_accum_steps
@@ -533,8 +541,25 @@ def main():
         train_df["label_id"] = train_df["label_id"].astype(int)
 
         logging.info(f"Label distribution:")
-        for label_id, count in train_df["label_id"].value_counts().sort_index().items():
+        label_counts = train_df["label_id"].value_counts().sort_index()
+        for label_id, count in label_counts.items():
             logging.info(f"  {ID2LABEL.get(label_id, '?')}: {format_number(count)}")
+
+    # ── Compute class weights for weighted CE loss ──
+    class_weights = None
+    if USE_CLASS_WEIGHTS:
+        n_total = len(train_df)
+        class_counts = train_df["label_id"].value_counts().sort_index()
+        weights = []
+        for c in range(NUM_CLASSES):
+            n_c = class_counts.get(c, 1)
+            weights.append(n_total / (NUM_CLASSES * n_c))
+        class_weights = torch.tensor(weights, dtype=torch.float32)
+        # Normalize so mean weight = 1.0 (preserves loss scale)
+        class_weights = class_weights / class_weights.mean()
+        logging.info(f"Class weights (inverse-frequency, normalized):")
+        for c in range(NUM_CLASSES):
+            logging.info(f"  {ID2LABEL.get(c, '?')}: {class_weights[c]:.4f}")
 
     # ── Initialize encoder for embedding pre-computation ──
     with timer("Initializing frozen encoder"):
@@ -615,6 +640,7 @@ def main():
             baseline=baseline,
             device=device,
             epoch=epoch,
+            class_weights=class_weights.to(device) if class_weights is not None else None,
         )
 
         baseline = metrics["baseline"]

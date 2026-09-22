@@ -369,6 +369,22 @@ $$\text{SFR} = \frac{1}{M \cdot P} \sum_{i=1}^{M} \sum_{p=1}^{P} \mathbb{I}\left
 
 ---
 
+### 6. Ablation Study — Does $R_{cons}$ Actually Drive De-biasing?
+
+A key reviewer concern is whether the **Counterfactual Consistency Reward** ($R_{cons}$) is the primary driver of shortcut suppression, or whether the FGA architecture alone is sufficient.
+
+We train a fresh FGA + Classifier for 5 epochs with **$\lambda_{cons} = 0$** (only $R_{acc}$, no consistency penalty), using the same class-weighted CE loss and hyperparameters:
+
+| Ablation Variant | Accuracy | Macro-F1 | Macro-Precision | Macro-Recall | SFR | $\Delta$ SFR vs Full |
+|:-----------------|:--------:|:--------:|:---------------:|:------------:|:---:|:--------------------:|
+| **CL-SDRG (Full: $R_{acc} + R_{cons}$)** | **0.7710** | **0.4767** | **0.5421** | **0.4767** | **0.0918** | — |
+| **No $R_{cons}$ (only $R_{acc}$)** | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
+
+> [!NOTE]
+> **Expected Outcome**: Removing $R_{cons}$ will cause the Speaker Flip Rate to increase significantly (from ~9% to 25–50%), empirically proving that the Counterfactual Consistency Reward is the mechanism responsible for de-biasing, not merely the FGA's gating capacity. Results will be updated after the next Colab run.
+
+---
+
 ## 🚀 Quick Start {#quick-start}
 
 ### Option 1: Google Colab (Recommended)
@@ -383,8 +399,8 @@ $$\text{SFR} = \frac{1}{M \cdot P} \sum_{i=1}^{M} \sum_{p=1}^{P} \mathbb{I}\left
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/CL-SDRG.git
-cd CL-SDRG
+git clone https://github.com/Talhaasif7/cross-lingual-rl-factcheck.git
+cd cross-lingual-rl-factcheck
 
 # Install dependencies
 pip install -r requirements.txt
@@ -479,9 +495,9 @@ If you use this work, please cite:
 @article{clsdrg2026,
   title     = {Cross-Lingual Shortcut De-biasing via Reinforcement Learning 
                Gating on Frozen Transformer Representations},
-  author    = {Your Name},
+  author    = {Talha Asif},
   year      = {2026},
-  note      = {GitHub: https://github.com/YOUR_USERNAME/CL-SDRG}
+  note      = {GitHub: https://github.com/Talhaasif7/cross-lingual-rl-factcheck}
 }
 ```
 

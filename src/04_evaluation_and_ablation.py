@@ -49,7 +49,7 @@ from src.config import (
     RETRIEVAL_K_VALUES, FAISS_NPROBE,
     SFR_TARGET, SFR_NUM_PERTURBATIONS,
     RANDOM_SEED, LABEL2ID, ID2LABEL,
-    PHYSICAL_BATCH_SIZE,
+    PHYSICAL_BATCH_SIZE, USE_CLASS_WEIGHTS,
 )
 from src.config import init_directories
 from src.utils import (
@@ -428,6 +428,188 @@ def run_zero_shot_baseline(
 
 
 # ============================================================================
+# 4b. ABLATION: NO CONSISTENCY REWARD (proves R_cons drives de-biasing)
+# ============================================================================
+
+def run_no_consistency_ablation(
+    train_claim_embs: torch.Tensor,
+    train_speaker_embs: torch.Tensor,
+    train_date_embs: torch.Tensor,
+    train_labels: torch.Tensor,
+    speaker_emb_map: dict,
+    test_claim_embs: torch.Tensor,
+    test_speaker_embs: torch.Tensor,
+    test_date_embs: torch.Tensor,
+    test_labels: np.ndarray,
+    device: torch.device,
+    ablation_epochs: int = 5,
+    class_weights: torch.Tensor = None,
+) -> dict:
+    """
+    Ablation: Train FGA + Classifier with λ_cons = 0 (no consistency reward).
+
+    This proves that the Counterfactual Consistency Reward is responsible
+    for the SFR reduction, not the FGA architecture alone.
+
+    Args:
+        train_*_embs: Pre-computed train embeddings (from Phase 1 cache)
+        train_labels: Training labels tensor
+        speaker_emb_map: Dict of speaker name → embedding
+        test_*_embs: Pre-computed test embeddings
+        test_labels: Test labels array
+        device: Compute device
+        ablation_epochs: Number of training epochs (5 is sufficient)
+        class_weights: Optional class weights for CE loss
+
+    Returns:
+        dict: Classification metrics + SFR for the ablation variant
+    """
+    from torch.utils.data import Dataset, DataLoader
+
+    logging.info("\n" + "=" * 70)
+    logging.info("  ABLATION: No R_cons (λ_cons = 0, only R_acc)")
+    logging.info("=" * 70)
+
+    # --- Lightweight dataset for ablation training ---
+    class AblationDataset(Dataset):
+        def __init__(self, c_emb, s_emb, d_emb, labels, sp_map):
+            self.c = c_emb
+            self.s = s_emb
+            self.d = d_emb
+            self.labels = labels
+            self.speakers = list(sp_map.keys())
+            self.sp_map = sp_map
+
+        def __len__(self):
+            return len(self.labels)
+
+        def __getitem__(self, idx):
+            # Sample a random counterfactual speaker
+            cf_sp = random.choice(self.speakers)
+            return {
+                "ce": self.c[idx], "se": self.s[idx], "de": self.d[idx],
+                "lbl": self.labels[idx],
+                "cf_se": self.sp_map[cf_sp],
+            }
+
+    abl_dataset = AblationDataset(
+        train_claim_embs, train_speaker_embs, train_date_embs,
+        train_labels, speaker_emb_map,
+    )
+    abl_loader = DataLoader(
+        abl_dataset, batch_size=PHYSICAL_BATCH_SIZE,
+        shuffle=True, num_workers=0, drop_last=True,
+    )
+
+    # --- Fresh model ---
+    abl_fga = FeatureGatingAgent().to(device)
+    abl_fusion = GatedFusion().to(device)
+    abl_classifier = VeracityClassifier().to(device)
+
+    abl_params = list(abl_fga.parameters()) + list(abl_classifier.parameters())
+    abl_optimizer = torch.optim.AdamW(abl_params, lr=1e-4, weight_decay=0.01)
+    abl_scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+
+    cw = class_weights.to(device) if class_weights is not None else None
+
+    # --- Train with λ_cons = 0 ---
+    baseline = 0.0
+    for epoch in range(ablation_epochs):
+        abl_fga.train()
+        abl_classifier.train()
+        ep_losses, correct, total = [], 0, 0
+        abl_optimizer.zero_grad()
+
+        pbar = tqdm(abl_loader, desc=f"Ablation Epoch {epoch+1}/{ablation_epochs}", unit="batch")
+        for step, batch in enumerate(pbar):
+            eq = batch["ce"].to(device)
+            es = batch["se"].to(device)
+            et = batch["de"].to(device)
+            tgt = batch["lbl"].to(device)
+
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+                aq, a_s, at = abl_fga(eq, es, et)
+                logits = abl_classifier(abl_fusion(eq, es, et, aq, a_s, at))
+                preds = logits.argmax(dim=-1)
+
+                # Only R_acc, NO R_cons
+                r_acc = (preds == tgt).float() * 2.0 - 1.0
+                r_total = r_acc  # λ_cons = 0
+
+                log_p = F.log_softmax(logits, dim=-1).gather(1, preds.unsqueeze(1)).squeeze(1)
+                advantage = (r_total - baseline).detach()
+                policy_loss = -torch.mean(advantage * log_p)
+
+                ce_loss = F.cross_entropy(logits, tgt, weight=cw)
+                total_loss = (policy_loss + 0.5 * ce_loss) / 16
+
+            abl_scaler.scale(total_loss).backward()
+
+            if (step + 1) % 16 == 0 or (step + 1) == len(abl_loader):
+                abl_scaler.unscale_(abl_optimizer)
+                torch.nn.utils.clip_grad_norm_(abl_params, max_norm=1.0)
+                abl_scaler.step(abl_optimizer)
+                abl_scaler.update()
+                abl_optimizer.zero_grad()
+
+            batch_reward = r_total.mean().item()
+            baseline = 0.99 * baseline + 0.01 * batch_reward
+
+            ep_losses.append(total_loss.item() * 16)
+            correct += (preds == tgt).sum().item()
+            total += len(tgt)
+
+            pbar.set_postfix(loss=f"{np.mean(ep_losses[-50:]):.4f}", acc=f"{correct/total:.3f}")
+
+        logging.info(
+            f"  Ablation Epoch {epoch+1}: Loss={np.mean(ep_losses):.4f}, "
+            f"Acc={correct/total:.4f}"
+        )
+
+    # --- Evaluate classification ---
+    abl_fga.eval()
+    abl_classifier.eval()
+
+    all_preds = []
+    with torch.no_grad():
+        for i in range(0, len(test_claim_embs), PHYSICAL_BATCH_SIZE):
+            eq = test_claim_embs[i:i+PHYSICAL_BATCH_SIZE].to(device)
+            es = test_speaker_embs[i:i+PHYSICAL_BATCH_SIZE].to(device)
+            et = test_date_embs[i:i+PHYSICAL_BATCH_SIZE].to(device)
+
+            aq, a_s, at = abl_fga(eq, es, et)
+            logits = abl_classifier(abl_fusion(eq, es, et, aq, a_s, at))
+            all_preds.append(logits.argmax(dim=-1).cpu().numpy())
+
+    all_preds = np.concatenate(all_preds)
+    abl_metrics = compute_classification_metrics(test_labels, all_preds)
+
+    # --- Evaluate SFR ---
+    abl_sfr = compute_speaker_flip_rate(
+        abl_fga, abl_fusion, abl_classifier,
+        test_claim_embs, test_speaker_embs, test_date_embs,
+        speaker_emb_map, device,
+        num_perturbations=SFR_NUM_PERTURBATIONS,
+    )
+
+    abl_metrics["method"] = "No R_cons Ablation"
+    abl_metrics["sfr"] = abl_sfr["sfr"]
+    abl_metrics["sfr_target_met"] = abl_sfr["target_met"]
+
+    logging.info(f"\n  Ablation Results (No R_cons):")
+    logging.info(f"    Accuracy:  {abl_metrics['accuracy']:.4f}")
+    logging.info(f"    Macro-F1:  {abl_metrics['macro_f1']:.4f}")
+    logging.info(f"    SFR:       {abl_sfr['sfr']:.4f} ({abl_sfr['sfr']*100:.2f}%)")
+
+    # Cleanup
+    del abl_fga, abl_fusion, abl_classifier, abl_optimizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return abl_metrics
+
+
+# ============================================================================
 # 5. VISUALIZATION
 # ============================================================================
 
@@ -662,8 +844,12 @@ def main():
     # ── Pre-compute train embeddings for baselines ──
     with timer("Pre-computing train embeddings"):
         train_claims = train_df["claimReviewed"].tolist()
+        train_speakers = train_df["itemReviewed.author.name"].tolist()
+        train_dates = train_df["datePublished"].astype(str).tolist()
         train_labels_arr = train_df["label_id"].values
         train_claim_embs = encode_batch(train_claims, "Train claims")
+        train_speaker_embs = encode_batch(train_speakers, "Train speakers")
+        train_date_embs = encode_batch(train_dates, "Train dates")
 
     # Free encoder VRAM
     del encoder
@@ -790,6 +976,38 @@ def main():
     zero_shot_metrics.update(zs_cls_metrics)
     ablation_results.append(zero_shot_metrics)
     logging.info(f"  Zero-Shot: Acc={zero_shot_metrics['accuracy']:.4f}, F1={zero_shot_metrics['macro_f1']:.4f}")
+
+    # Ablation 3: No-Consistency-Reward (proves R_cons drives de-biasing)
+    # Compute class weights for ablation (same as main training)
+    abl_class_weights = None
+    if USE_CLASS_WEIGHTS:
+        n_total = len(train_df)
+        class_counts = train_df["label_id"].value_counts().sort_index()
+        weights = []
+        for c in range(NUM_CLASSES):
+            n_c = class_counts.get(c, 1)
+            weights.append(n_total / (NUM_CLASSES * n_c))
+        abl_class_weights = torch.tensor(weights, dtype=torch.float32)
+        abl_class_weights = abl_class_weights / abl_class_weights.mean()
+
+    train_labels_tensor = torch.tensor(train_labels_arr, dtype=torch.long)
+    no_rcons_metrics = run_no_consistency_ablation(
+        train_claim_embs=train_claim_embs,
+        train_speaker_embs=train_speaker_embs,
+        train_date_embs=train_date_embs,
+        train_labels=train_labels_tensor,
+        speaker_emb_map=speaker_emb_map,
+        test_claim_embs=test_claim_embs,
+        test_speaker_embs=test_speaker_embs,
+        test_date_embs=test_date_embs,
+        test_labels=test_labels,
+        device=device,
+        ablation_epochs=5,
+        class_weights=abl_class_weights,
+    )
+    ablation_results.append(no_rcons_metrics)
+    logging.info(f"  No R_cons: Acc={no_rcons_metrics['accuracy']:.4f}, "
+                 f"F1={no_rcons_metrics['macro_f1']:.4f}, SFR={no_rcons_metrics['sfr']:.4f}")
 
     # ── Print results table ──
     print_results_table(cl_sdrg_metrics, ablation_results, sfr_result)
